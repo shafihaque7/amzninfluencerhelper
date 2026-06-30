@@ -62,21 +62,7 @@ Results are cached in memory for 1 hour — repeat requests for the same URL rep
 
 ## Setup
 
-### 1. Clone and install Python dependencies
-
-```bash
-pip install flask selenium openai python-dotenv
-```
-
-### 2. Install frontend dependencies
-
-```bash
-cd frontend
-npm install
-cd ..
-```
-
-### 3. Configure environment variables
+### Configure environment variables
 
 ```bash
 cp .env.example .env
@@ -94,11 +80,44 @@ The key is only used to generate title suggestions for not-shown videos. The scr
 
 ## Running
 
-You need two processes running simultaneously.
+There are two ways to run the app locally.
 
-### Backend (Flask API)
+---
+
+### Option A — Docker (recommended, no local Chrome or Python setup needed)
+
+**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 
 ```bash
+# Build the image (takes ~5 min the first time — installs Chrome)
+docker build -t amzn-influencer .
+
+# Run it (replace the key value with yours)
+docker run --rm -p 8000:8000 \
+  -e OPENAI_API_KEY=sk-proj-... \
+  amzn-influencer
+```
+
+Open **http://localhost:8000** in your browser.
+
+> **Apple Silicon (M1/M2/M3):** add `--platform linux/amd64` to both commands since the image targets amd64:
+> ```bash
+> docker build --platform linux/amd64 -t amzn-influencer .
+> docker run --rm --platform linux/amd64 -p 8000:8000 -e OPENAI_API_KEY=sk-proj-... amzn-influencer
+> ```
+
+---
+
+### Option B — Local dev (faster iteration, live reload)
+
+**Prerequisites:** Python 3.11+, Node.js 18+, Google Chrome, matching ChromeDriver
+
+You need two processes running simultaneously.
+
+#### Backend (Flask API)
+
+```bash
+pip install -r backend/requirements.txt
 python backend/api.py
 ```
 
@@ -108,29 +127,30 @@ Starts on `http://localhost:5000`. To show a Chrome window during scraping (usef
 FLASK_DEBUG=true python backend/api.py
 ```
 
-### Frontend (Vite dev server)
+#### Frontend (Vite dev server)
 
 ```bash
 cd frontend
+npm install
 npm run dev
 ```
 
-Opens at `http://localhost:5173`. The dev server proxies `/scrape/stream` to the Flask backend — no CORS configuration needed.
+Opens at `http://localhost:5173`. The Vite dev server proxies `/scrape/stream` and `/suggest/stream` to the Flask backend — no CORS configuration needed.
 
-### Build for production
+#### Build for production (optional)
 
 ```bash
 cd frontend
 npm run build
 ```
 
-The compiled static files land in `frontend/dist/`. Serve them from Flask or any static host.
+The compiled static files land in `frontend/dist/`. When present, Flask automatically serves them — no separate static host needed.
 
 ---
 
 ## Usage
 
-1. Open `http://localhost:5173`
+1. Open `http://localhost:8000` (Docker) or `http://localhost:5173` (local dev)
 2. Paste an Amazon influencer storefront URL — e.g. `https://www.amazon.com/shop/techthatinterest`
 3. Click **Scrape**
 
@@ -188,6 +208,7 @@ Streams Server-Sent Events. Each event is a JSON object with a `type` field.
 │   ├── api.py                  # Flask API — SSE endpoint, URL validation, in-memory cache
 │   ├── scrape_videos.py        # Selenium scraper — storefront + parallel product page checks
 │   ├── suggest.py              # OpenAI title suggestions with retry / backoff
+│   ├── requirements.txt        # Python dependencies
 │   └── tests/
 │       ├── test_api.py         # 31 tests — endpoints, URL validation, cache
 │       ├── test_scrape_videos.py # 26 tests — HTML parsing, product page checks, stream
@@ -198,6 +219,8 @@ Streams Server-Sent Events. Each event is a JSON object with a `type` field.
 │   │   └── index.css           # Tailwind entry
 │   ├── index.html              # Sets page title to AmznInfluencerScraper
 │   └── package.json
+├── Dockerfile                  # Multi-stage build: Node.js (frontend) + Python/Chrome (backend)
+├── deploy-azure.sh             # One-command Azure Container Apps deployment
 └── .env                        # OPENAI_API_KEY (gitignored)
 ```
 
@@ -233,10 +256,50 @@ backend/tests/test_suggest.py        15 passed
 
 ---
 
+## Deploying to Azure
+
+The included `deploy-azure.sh` script deploys the full application to **Azure Container Apps** using a single Docker image (Chrome + Python backend + built React frontend).
+
+### Prerequisites
+
+```bash
+brew install azure-cli
+az login
+export OPENAI_API_KEY=sk-proj-...   # your key
+```
+
+### Deploy
+
+```bash
+chmod +x deploy-azure.sh
+./deploy-azure.sh
+```
+
+The script will:
+
+1. Create a resource group and an Azure Container Registry
+2. Build the Docker image in the cloud via `az acr build` (~10–15 min the first time)
+3. Create an Azure Container Apps environment and deploy the app (2 vCPU / 4 GiB RAM)
+4. Store your `OPENAI_API_KEY` as an Azure secret
+
+When it finishes, it prints a `https://` URL where the app is live.
+
+**Notes:**
+- The app scales to **zero** when not in use — no cost while idle
+- The first request after idle takes ~60 s for the container to start
+- To keep it always warm (instant first load), edit the script and set `--min-replicas 1` (~$30/month)
+
+### Updating after code changes
+
+```bash
+az acr build --registry <ACR_NAME> --image amzn-influencer:latest --platform linux/amd64 .
+az containerapp update --name amzn-influencer --resource-group amzn-influencer-rg --image <ACR_SERVER>/amzn-influencer:latest
+```
+
+---
+
 ## Known Limitations
 
-- **Slow by design:** Each product page load takes several seconds because the browser must wait for JS-rendered widgets. Scraping a storefront with 30 videos takes ~5–10 minutes.
-- **Single-threaded:** The Flask server runs in single-threaded mode (`threaded=False`) to avoid multiple Chrome instances competing for resources.
-- **In-process cache:** The 1-hour result cache lives in the Flask process. It resets on server restart and is not shared across workers.
-- **ChromeDriver must match Chrome:** If ChromeDriver and Chrome are out of sync, Selenium will fail to launch. Use `chromedriver-autoinstaller` or keep them pinned to the same version.
+- **Slow by design:** Each product page load takes several seconds because the browser must wait for JS-rendered widgets. Scraping a storefront with 30 videos takes ~5–10 minutes even with parallel workers.
+- **In-process cache:** The 1-hour result cache lives in the Flask process. It resets on server restart and is not shared across workers or replicas.
 - **Amazon page changes:** Scraping logic depends on specific element IDs (`videoTab`, `videoTabContentContainer`, `productTitle`). Amazon UI changes may require updating selectors.

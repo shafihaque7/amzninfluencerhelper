@@ -197,7 +197,7 @@ class TestLoadStorefront(unittest.TestCase):
         driver.find_element.return_value = container
 
         result = _load_storefront(driver, "https://www.amazon.com/shop/test")
-        self.assertEqual(result, "<div>video cards</div>")
+        self.assertEqual(result[0], "<div>video cards</div>")
 
 
 # ─── scrape_videos_stream ─────────────────────────────────────────────────────
@@ -210,7 +210,8 @@ class TestScrapeVideosStream(unittest.TestCase):
         mock_build.return_value = MagicMock()
         mock_load.return_value = (
             _make_video_html("Product A", "B001", "v:s")
-            + _make_video_html("Product B", "B002", "v:s")
+            + _make_video_html("Product B", "B002", "v:s"),
+            "Test Storefront",
         )
         mock_check.side_effect = [(True, "Product A Name"), (False, "Product B Name")]
 
@@ -230,13 +231,14 @@ class TestScrapeVideosStream(unittest.TestCase):
 
     @patch("scrape_videos.build_driver")
     @patch("scrape_videos._load_storefront")
-    def test_empty_storefront_yields_done_with_zeros(self, mock_load, mock_build):
+    def test_empty_storefront_yields_error(self, mock_load, mock_build):
         mock_build.return_value = MagicMock()
-        mock_load.return_value = ""
+        mock_load.return_value = ("", "Test Storefront")
 
         events = list(scrape_videos_stream("https://www.amazon.com/shop/test"))
-        done = next(e[1] for e in events if e[0] == "done")
-        self.assertEqual(done, {"total": 0, "shown": 0, "not_shown": 0})
+        error_events = [e for e in events if e[0] == "error"]
+        self.assertEqual(len(error_events), 1)
+        self.assertIn("empty", error_events[0][1]["message"])
 
     @patch("scrape_videos.build_driver")
     @patch("scrape_videos._load_storefront")
@@ -254,7 +256,7 @@ class TestScrapeVideosStream(unittest.TestCase):
     @patch("scrape_videos.check_shown_on_product_page")
     def test_video_event_contains_product_name(self, mock_check, mock_load, mock_build):
         mock_build.return_value = MagicMock()
-        mock_load.return_value = _make_video_html("My Video", "B001", "v:s")
+        mock_load.return_value = (_make_video_html("My Video", "B001", "v:s"), "Test Storefront")
         mock_check.return_value = (True, "Actual Product Name")
 
         events = list(scrape_videos_stream("https://www.amazon.com/shop/test"))

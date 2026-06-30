@@ -453,9 +453,22 @@ export default function App() {
 
           {/* Error state */}
           {phase === "error" && (
-            <div className="rounded-2xl bg-red-500/20 border border-red-400/30 p-5 text-red-200 text-sm">
-              <p className="font-semibold mb-1">Something went wrong</p>
-              <p className="font-mono text-xs break-all">{errorMsg}</p>
+            <div className="rounded-2xl bg-red-500/20 border border-red-400/30 p-5 text-red-200 text-sm flex flex-col gap-3">
+              <div className="flex items-center gap-2">
+                <svg className="w-5 h-5 shrink-0 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                </svg>
+                <p className="font-semibold text-red-100">Scrape failed</p>
+              </div>
+              <p className="text-red-200 leading-relaxed">{errorMsg}</p>
+              {(errorMsg.includes("local machine") || errorMsg.includes("CAPTCHA") || errorMsg.includes("blocked")) && (
+                <div className="rounded-xl bg-white/5 border border-white/10 px-4 py-3 text-xs text-slate-300 flex flex-col gap-1">
+                  <span className="font-semibold text-white">How to fix</span>
+                  <span>Amazon blocks scraping from cloud datacenter IPs. Run the backend on your own computer:</span>
+                  <code className="mt-1 bg-black/30 rounded px-2 py-1 font-mono text-slate-200 whitespace-pre">python backend/api.py</code>
+                  <span className="mt-1">then open <span className="font-mono text-indigo-300">http://localhost:5173</span> in your browser.</span>
+                </div>
+              )}
             </div>
           )}
 

@@ -11,19 +11,23 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
-# Load .env so GEMINI_API_KEY is available without a shell export
 try:
     from dotenv import load_dotenv
     load_dotenv(override=True)
 except ImportError:
-    pass  # dotenv is optional; fall back to process env
+    pass
 
-from flask import Flask, Response, jsonify, request, stream_with_context
+from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
 from scrape_videos import DEFAULT_URL, scrape_videos_stream
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 log = logging.getLogger(__name__)
 app = Flask(__name__)
 
@@ -212,6 +216,21 @@ def suggest_stream():
             "Connection": "keep-alive",
         },
     )
+
+
+_FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    """Serve the built React app in production (no-op when dist/ doesn't exist)."""
+    if not _FRONTEND_DIST.exists():
+        return jsonify({"error": "Frontend not built. Run: cd frontend && npm run build"}), 404
+    target = _FRONTEND_DIST / path
+    if path and target.exists() and target.is_file():
+        return send_from_directory(str(_FRONTEND_DIST), path)
+    return send_from_directory(str(_FRONTEND_DIST), "index.html")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+try:
+    from selenium_stealth import stealth as _apply_stealth
+    _STEALTH_AVAILABLE = True
+except ImportError:
+    _STEALTH_AVAILABLE = False
+
 log = logging.getLogger(__name__)
 
 DEFAULT_URL = (
@@ -73,13 +79,36 @@ def build_driver(headless: bool = True) -> webdriver.Chrome:
     opts = Options()
     if headless:
         opts.add_argument("--headless=new")
+    # Required for running in Docker/containers
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-setuid-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1400,900")
+    opts.add_argument("--disable-gpu")
+    # Anti-bot-detection
+    opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument(f"user-agent={_USER_AGENT}")
+    # Stability / rendering
+    opts.add_argument("--window-size=1400,900")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--disable-popup-blocking")
+    opts.add_argument("--ignore-certificate-errors")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    return webdriver.Chrome(options=opts)
+    driver = webdriver.Chrome(options=opts)
+    if _STEALTH_AVAILABLE:
+        _apply_stealth(
+            driver,
+            languages=["en-US", "en"],
+            vendor="Google Inc.",
+            platform="Win32",
+            webgl_vendor="Intel Inc.",
+            renderer="Intel Iris OpenGL Engine",
+            fix_hairline=True,
+        )
+        log.debug("selenium-stealth applied")
+    return driver
 
 
 def extract_entries_from_html(html: str) -> list[VideoEntry]:
@@ -112,19 +141,22 @@ def extract_entries_from_html(html: str) -> list[VideoEntry]:
     return entries
 
 
-def _load_storefront(driver: webdriver.Chrome, url: str) -> str:
+def _load_storefront(driver: webdriver.Chrome, url: str) -> tuple[str, str]:
     """
     Navigate to the storefront, click the Videos tab, scroll to lazy-load all
-    cards, and return the innerHTML of the video container.
+    cards, and return (innerHTML of the video container, page title).
 
     Raises RuntimeError if the Videos tab is not found within the timeout.
     """
     driver.get(url)
     wait = WebDriverWait(driver, _PAGE_LOAD_TIMEOUT)
 
+    log.info("Page title after load: %r", driver.title)
+
     try:
         wait.until(EC.presence_of_element_located((By.ID, "videoTab")))
     except TimeoutException as exc:
+        log.warning("videoTab not found. Page title: %r | URL: %s", driver.title, driver.current_url)
         raise RuntimeError(
             "Could not find the Videos tab. The storefront may not have videos "
             "or the page took too long to load."
@@ -133,20 +165,25 @@ def _load_storefront(driver: webdriver.Chrome, url: str) -> str:
 
     video_tab = driver.find_element(By.ID, "videoTab")
     driver.execute_script("arguments[0].click();", video_tab)
-    log.debug("Clicked Videos tab")
+    log.info("Clicked Videos tab")
 
     try:
         wait.until(EC.invisibility_of_element_located((By.ID, "videoTabSpinner")))
     except TimeoutException:
-        log.debug("videoTabSpinner did not disappear within timeout; continuing anyway")
-    time.sleep(3)
+        log.info("videoTabSpinner did not disappear within timeout; continuing anyway")
+    time.sleep(5)  # extra wait for JS rendering in cloud environments
 
     for _ in range(_STOREFRONT_SCROLL_STEPS):
         driver.execute_script(f"window.scrollBy(0, {_STOREFRONT_SCROLL_PX})")
         time.sleep(_STOREFRONT_SCROLL_PAUSE)
 
+    time.sleep(2)  # settle after scrolling
+
     container = driver.find_element(By.ID, "videoTabContentContainer")
-    return container.get_attribute("innerHTML")
+    inner_html = container.get_attribute("innerHTML")
+    page_title = driver.title
+    log.info("Page title: %r | Container HTML: %d chars", page_title, len(inner_html))
+    return inner_html, page_title
 
 
 def check_shown_on_product_page(
@@ -211,16 +248,40 @@ def scrape_videos_stream(url: str, headless: bool = True) -> Generator[SseEvent,
 
     try:
         try:
-            inner_html = _load_storefront(storefront_driver, url)
+            inner_html, page_title = _load_storefront(storefront_driver, url)
         except RuntimeError as exc:
             yield "error", {"message": str(exc)}
             return
 
+        yield "status", {"message": f"Storefront loaded: \"{page_title}\""}
+
         entries = extract_entries_from_html(inner_html)
 
         if not entries:
-            log.info("No video entries found")
-            yield "done", {"total": 0, "shown": 0, "not_shown": 0}
+            container_len = len(inner_html)
+            title_lower = page_title.lower()
+            if "robot check" in title_lower or "captcha" in title_lower or "sorry" in title_lower:
+                msg = (
+                    f"Amazon blocked this request — CAPTCHA/bot-check detected "
+                    f"(page title: \"{page_title}\"). "
+                    "Cloud server IPs are routinely blocked by Amazon. "
+                    "Run the scraper from your local machine instead."
+                )
+            elif container_len < 200:
+                msg = (
+                    f"The video container loaded but was empty ({container_len} chars). "
+                    f"Page title: \"{page_title}\". "
+                    "Amazon may be suppressing content for cloud server IPs, or the Videos tab "
+                    "failed to render. Try running locally."
+                )
+            else:
+                msg = (
+                    f"No video cards found in the storefront. "
+                    f"Page title: \"{page_title}\" | Container: {container_len} chars. "
+                    "The page loaded but contained no video entries — "
+                    "check that this storefront has a Videos tab."
+                )
+            yield "error", {"message": msg, "page_title": page_title, "container_html_length": container_len}
             return
 
         log.info("Found %d video entries", len(entries))
@@ -248,13 +309,17 @@ def scrape_videos_stream(url: str, headless: bool = True) -> Generator[SseEvent,
             worker_drivers.append(d)
             driver_pool.put(d)
 
-        def _check_entry(entry: VideoEntry, index: int) -> tuple[int, VideoEntry]:
+        def _check_entry(entry: VideoEntry, index: int) -> tuple[int, VideoEntry, str]:
             driver = driver_pool.get()
+            prod_page_title = ""
             try:
                 entry.shown_on_product_page, entry.product_name = check_shown_on_product_page(driver, entry)
+                prod_page_title = driver.title  # driver is still on the product page here
             finally:
                 driver_pool.put(driver)
-            return index, entry
+            return index, entry, prod_page_title
+
+        first_diag_done = False
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {
@@ -263,10 +328,32 @@ def scrape_videos_stream(url: str, headless: bool = True) -> Generator[SseEvent,
             }
             for future in as_completed(futures):
                 try:
-                    index, entry = future.result()
+                    index, entry, prod_page_title = future.result()
                 except Exception as exc:
                     log.warning("Worker error: %s", exc)
                     continue
+
+                # Emit a one-time diagnostic after the first result so the UI
+                # shows what Amazon actually served on product pages.
+                if not first_diag_done:
+                    first_diag_done = True
+                    vendor_preview = (entry.vendor_code or "")[:10]
+                    title_lower = prod_page_title.lower()
+                    if "robot check" in title_lower or "captcha" in title_lower:
+                        diag = (
+                            f"Product page blocked — Amazon returned a CAPTCHA "
+                            f"(title: \"{prod_page_title}\"). "
+                            "Video widget data will not be present; all results will show as Not Shown. "
+                            "Run the scraper locally to get accurate results."
+                        )
+                    else:
+                        diag = (
+                            f"Product page loaded: \"{prod_page_title}\" | "
+                            f"vendor_code ({vendor_preview}…) "
+                            f"{'FOUND ✓' if entry.shown_on_product_page else 'NOT found — video widget may not be rendering on this IP'}"
+                        )
+                    yield "status", {"message": diag}
+
                 log.debug("[%d/%d] shown=%s  %s", index, len(entries), entry.shown_on_product_page, entry.title[:60])
                 yield "video", {**asdict(entry), "index": index, "total": len(entries)}
 
