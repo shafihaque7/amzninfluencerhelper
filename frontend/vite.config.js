@@ -10,6 +10,11 @@ export default defineConfig({
         timeout: 600000,
         proxyTimeout: 600000,
       },
+      '/suggest': {
+        target: 'http://127.0.0.1:5000',
+        timeout: 60000,
+        proxyTimeout: 60000,
+      },
       '/health': 'http://127.0.0.1:5000',
     },
   },

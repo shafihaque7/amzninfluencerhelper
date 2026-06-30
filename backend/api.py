@@ -3,6 +3,7 @@ Flask API for the Amazon influencer storefront video scraper.
 
 Endpoints:
     GET  /scrape/stream?url=<storefront_url>&headless=true  — SSE stream
+    GET  /suggest/stream?url=<storefront_url>&asin=<asin>&title=<title>&product_name=<name>
     GET  /health
 """
 
@@ -59,6 +60,24 @@ def _cache_age_minutes(url: str) -> int | None:
     if entry:
         return int((time.time() - entry[0]) / 60)
     return None
+
+
+def _cache_append_suggestion(url: str, suggestion_event: tuple[str, dict]) -> None:
+    """Insert a suggestion event into an existing cache entry (before stream_end)."""
+    entry = _cache.get(url)
+    if not entry:
+        return
+    timestamp, events = entry
+    updated = []
+    inserted = False
+    for ev in events:
+        if ev[0] == "stream_end" and not inserted:
+            updated.append(suggestion_event)
+            inserted = True
+        updated.append(ev)
+    if not inserted:
+        updated.append(suggestion_event)
+    _cache[url] = (timestamp, updated)
 
 
 # ─── URL validation ───────────────────────────────────────────────────────────
@@ -125,6 +144,64 @@ def scrape_stream():
         except Exception as exc:
             log.exception("Stream generation error")
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/suggest/stream")
+def suggest_stream():
+    """Generate an AI title suggestion for a single not-shown video on demand.
+
+    Query params:
+        asin         — required
+        title        — video title
+        product_name — product name from the product page
+        url          — storefront URL (used to update the cache if present)
+    """
+    asin = request.args.get("asin", "").strip()
+    title = request.args.get("title", "").strip()
+    product_name = request.args.get("product_name", "").strip()
+    storefront_url = request.args.get("url", "").strip()
+
+    if not asin:
+        return jsonify({"error": "asin is required"}), 400
+
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    if not openai_key:
+        return jsonify({"error": "OPENAI_API_KEY not configured"}), 500
+
+    def generate():
+        from scrape_videos import VideoEntry
+        from suggest import suggest_better_title
+
+        entry = VideoEntry(
+            title=title,
+            product_url=f"https://www.amazon.com/dp/{asin}",
+            asin=asin,
+            vendor_code="",
+            product_name=product_name,
+        )
+        suggestion = suggest_better_title(entry, openai_key)
+
+        if suggestion["suggested_title"]:
+            event_data = {
+                "asin": asin,
+                "reason": suggestion["reason"],
+                "suggested_title": suggestion["suggested_title"],
+            }
+            if storefront_url and _is_valid_storefront_url(storefront_url):
+                _cache_append_suggestion(storefront_url, ("suggestion", event_data))
+            yield f"data: {json.dumps({'type': 'suggestion', **event_data})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'suggest_end', 'asin': asin})}\n\n"
 
     return Response(
         stream_with_context(generate()),

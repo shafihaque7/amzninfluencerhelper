@@ -40,7 +40,7 @@ function Badge({ shown }) {
   );
 }
 
-function VideoCard({ video, isChecking, suggestion }) {
+function VideoCard({ video, isChecking, suggestion, onSuggest }) {
   return (
     <div className={`bg-white rounded-2xl shadow-sm border p-5 flex flex-col gap-3 transition-all duration-300 ${isChecking ? "border-indigo-300 ring-2 ring-indigo-200" : "border-gray-100 hover:shadow-md"}`}>
       <div className="flex items-start justify-between gap-3">
@@ -85,7 +85,7 @@ function VideoCard({ video, isChecking, suggestion }) {
       )}
 
       {/* AI title suggestion — only for not-shown videos */}
-      {!isChecking && !video.shown_on_product_page && suggestion && (
+      {!isChecking && !video.shown_on_product_page && suggestion && suggestion !== "loading" && (
         <div className="mt-1 pt-3 border-t border-amber-100 flex flex-col gap-1.5">
           <span className="text-xs font-semibold text-amber-600">AI Suggested Title</span>
           <p className="text-xs font-medium text-gray-800">"{suggestion.suggested_title}"</p>
@@ -101,6 +101,19 @@ function VideoCard({ video, isChecking, suggestion }) {
           <Spinner className="h-3 w-3" />
           Generating title suggestion…
         </div>
+      )}
+
+      {/* On-demand suggest button — shown when not-shown and no suggestion yet */}
+      {!isChecking && !video.shown_on_product_page && !suggestion && onSuggest && (
+        <button
+          onClick={() => onSuggest(video)}
+          className="mt-1 pt-3 border-t border-gray-100 w-full text-left flex items-center gap-1.5 text-xs font-medium text-indigo-500 hover:text-indigo-700 transition-colors"
+        >
+          <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.346.346a5 5 0 01-1.45 3.45 5 5 0 01-7.072 0 5 5 0 01-1.45-3.45l-.346-.346z" />
+          </svg>
+          Get AI title suggestion
+        </button>
       )}
     </div>
   );
@@ -130,22 +143,77 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState("");
   const [filter, setFilter] = useState("all");
   const [suggestions, setSuggestions] = useState({}); // keyed by asin
+  const [scrapedUrl, setScrapedUrl] = useState("");
   const esRef = useRef(null);
+  const suggestEsSet = useRef(new Set()); // active on-demand suggestion streams
 
   function addLog(icon, text) {
     setLog((prev) => [...prev, { icon, text }]);
   }
 
+  function handleSuggest(video) {
+    // Mark as loading immediately
+    setSuggestions((prev) => ({ ...prev, [video.asin]: "loading" }));
+
+    const params = new URLSearchParams({
+      asin: video.asin,
+      title: video.title,
+      product_name: video.product_name || "",
+      url: scrapedUrl,
+    });
+    const es = new EventSource(`/suggest/stream?${params}`);
+    suggestEsSet.current.add(es);
+
+    es.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "suggestion") {
+        setSuggestions((prev) => ({
+          ...prev,
+          [msg.asin]: { reason: msg.reason, suggested_title: msg.suggested_title },
+        }));
+        addLog("💡", `Title suggestion ready for ${video.title.slice(0, 50)}`);
+      } else if (msg.type === "suggest_end") {
+        // If no suggestion came back, clear the loading state
+        setSuggestions((prev) => {
+          if (prev[msg.asin] === "loading") {
+            const next = { ...prev };
+            delete next[msg.asin];
+            return next;
+          }
+          return prev;
+        });
+        es.close();
+        suggestEsSet.current.delete(es);
+      }
+    };
+
+    es.onerror = () => {
+      setSuggestions((prev) => {
+        if (prev[video.asin] === "loading") {
+          const next = { ...prev };
+          delete next[video.asin];
+          return next;
+        }
+        return prev;
+      });
+      es.close();
+      suggestEsSet.current.delete(es);
+    };
+  }
+
   function startScrape(e) {
     e.preventDefault();
 
-    // Close any existing stream
+    // Close any existing streams
     if (esRef.current) {
       esRef.current.close();
       esRef.current = null;
     }
+    suggestEsSet.current.forEach((es) => es.close());
+    suggestEsSet.current.clear();
 
     // Reset state
+    setScrapedUrl(url);
     setPhase("scraping");
     setLog([]);
     setVideos([]);
@@ -198,19 +266,24 @@ export default function App() {
           );
           break;
 
-        case "done":
+        case "done": {
           setSummary({ shown: msg.shown, not_shown: msg.not_shown });
           setPhase("done");
           addLog("🏁", `Done! ${msg.shown} of ${msg.total} shown on product pages.`);
-          // Mark not-shown videos as awaiting a suggestion (backend may send them next)
-          setVideos((prev) => {
+          // Read videos snapshot directly — all video events have committed before
+          // done fires, so this snapshot is complete. Calling setSuggestions here
+          // keeps it in the same React batch and avoids a deferred-update race with
+          // the stream_end cleaner.
+          const notShown = videos
+            .filter((v) => !v._checking && !v.shown_on_product_page)
+            .slice(0, 10);
+          if (notShown.length > 0) {
             const pending = {};
-            prev.filter((v) => !v._checking && !v.shown_on_product_page).slice(0, 10)
-              .forEach((v) => { pending[v.asin] = "loading"; });
-            if (Object.keys(pending).length > 0) setSuggestions(pending);
-            return prev;
-          });
+            notShown.forEach((v) => { pending[v.asin] = "loading"; });
+            setSuggestions(pending);
+          }
           break;
+        }
 
         case "suggestion":
           setSuggestions((prev) => ({
@@ -235,6 +308,13 @@ export default function App() {
           break;
 
         case "stream_end":
+          // Clear any suggestions still in "loading" — they were never resolved
+          // (e.g. cache hit where suggestions weren't generated, or API errors)
+          setSuggestions((prev) => {
+            const cleaned = { ...prev };
+            Object.keys(cleaned).forEach((k) => { if (cleaned[k] === "loading") delete cleaned[k]; });
+            return Object.keys(cleaned).length !== Object.keys(prev).length ? cleaned : prev;
+          });
           es.close();
           esRef.current = null;
           break;
@@ -426,6 +506,7 @@ export default function App() {
                   video={video}
                   isChecking={!!video._checking}
                   suggestion={suggestions[video.asin]}
+                  onSuggest={phase === "done" ? handleSuggest : null}
                 />
               ))}
             </div>

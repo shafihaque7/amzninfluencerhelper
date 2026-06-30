@@ -29,17 +29,17 @@ Results are cached in memory for 1 hour — repeat requests for the same URL rep
 └────────────────────────┬────────────────────────────────────────┘
                          │  Server-Sent Events (SSE)
 ┌────────────────────────▼────────────────────────────────────────┐
-│  Flask API             api.py                                   │
+│  Flask API             backend/api.py                           │
 │  GET /scrape/stream    in-memory TTL cache (1 h)                │
 └────────────────────────┬────────────────────────────────────────┘
                          │  Python generator
 ┌────────────────────────▼────────────────────────────────────────┐
-│  Scraper               scrape_videos.py                         │
-│  Selenium / Chrome     storefront → product pages               │
+│  Scraper               backend/scrape_videos.py                 │
+│  Selenium / Chrome     storefront → product pages (parallel)    │
 └────────────────────────┬────────────────────────────────────────┘
                          │  API call (per not-shown video)
 ┌────────────────────────▼────────────────────────────────────────┐
-│  Title suggestions     suggest.py                               │
+│  Title suggestions     backend/suggest.py                       │
 │  OpenAI gpt-4o-mini    reason + suggested title per video       │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -96,13 +96,13 @@ You need two processes running simultaneously.
 ### Backend (Flask API)
 
 ```bash
-python api.py
+python backend/api.py
 ```
 
 Starts on `http://localhost:5000`. To show a Chrome window during scraping (useful for debugging):
 
 ```bash
-FLASK_DEBUG=true python api.py
+FLASK_DEBUG=true python backend/api.py
 ```
 
 ### Frontend (Vite dev server)
@@ -181,20 +181,21 @@ Streams Server-Sent Events. Each event is a JSON object with a `type` field.
 
 ```
 .
-├── api.py                  # Flask API — SSE endpoint, URL validation, in-memory cache
-├── scrape_videos.py        # Selenium scraper — storefront + product page checks
-├── suggest.py              # OpenAI title suggestions with retry / backoff
+├── backend/
+│   ├── api.py                  # Flask API — SSE endpoint, URL validation, in-memory cache
+│   ├── scrape_videos.py        # Selenium scraper — storefront + parallel product page checks
+│   ├── suggest.py              # OpenAI title suggestions with retry / backoff
+│   └── tests/
+│       ├── test_api.py         # 31 tests — endpoints, URL validation, cache
+│       ├── test_scrape_videos.py # 26 tests — HTML parsing, product page checks, stream
+│       └── test_suggest.py     # 15 tests — OpenAI mock, retry logic, JSON parsing
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx         # React app — SSE client, video cards, real-time UI
-│   │   └── index.css       # Tailwind entry
-│   ├── index.html          # Sets page title to AmznInfluencerScraper
+│   │   ├── App.jsx             # React app — SSE client, video cards, real-time UI
+│   │   └── index.css           # Tailwind entry
+│   ├── index.html              # Sets page title to AmznInfluencerScraper
 │   └── package.json
-├── tests/
-│   ├── test_api.py         # 31 tests — endpoints, URL validation, cache
-│   ├── test_scrape_videos.py # 26 tests — HTML parsing, product page checks, stream
-│   └── test_suggest.py     # 15 tests — OpenAI mock, retry logic, JSON parsing
-└── .env                    # OPENAI_API_KEY (gitignored)
+└── .env                        # OPENAI_API_KEY (gitignored)
 ```
 
 ---
@@ -202,15 +203,15 @@ Streams Server-Sent Events. Each event is a JSON object with a `type` field.
 ## Running Tests
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest backend/tests/ -v
 ```
 
 72 tests, all unit-level with no live network or browser calls. Selenium is mocked via `unittest.mock`; the OpenAI client is mocked via `@patch("suggest.OpenAI")`.
 
 ```
-tests/test_api.py            31 passed
-tests/test_scrape_videos.py  26 passed
-tests/test_suggest.py        15 passed
+backend/tests/test_api.py            31 passed
+backend/tests/test_scrape_videos.py  26 passed
+backend/tests/test_suggest.py        15 passed
 ```
 
 ---
