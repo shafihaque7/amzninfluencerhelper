@@ -49,6 +49,7 @@ class VideoEntry:
     asin: str
     vendor_code: str
     shown_on_product_page: bool = field(default=False)
+    product_name: str = field(default="")
 
 
 def build_driver(headless: bool) -> webdriver.Chrome:
@@ -93,10 +94,11 @@ def extract_entries_from_html(html: str) -> list[VideoEntry]:
 
 def check_shown_on_product_page(
     driver: webdriver.Chrome, entry: VideoEntry, scroll_pause: float = 0.6
-) -> bool:
+) -> tuple[bool, str]:
     """
     Load the product page with Selenium (so JS-rendered video widgets are present)
-    and return True if the influencer's vendor_code appears anywhere in the DOM.
+    and return (shown, product_name) where shown is True if the influencer's
+    vendor_code appears anywhere in the DOM.
 
     Plain requests won't work here for two reasons:
       1. Amazon detects bots and returns a ~5 KB stub instead of the real page.
@@ -105,7 +107,7 @@ def check_shown_on_product_page(
          on a full page load.
     """
     if not entry.asin or not entry.vendor_code:
-        return False
+        return False, ""
 
     try:
         driver.get(entry.product_url)
@@ -119,11 +121,20 @@ def check_shown_on_product_page(
             time.sleep(scroll_pause)
 
         page_source = driver.page_source
+
+        product_name = ""
+        try:
+            title_el = driver.find_element(By.ID, "productTitle")
+            product_name = title_el.text.strip()
+        except Exception:
+            pass
+
         vendor_code = entry.vendor_code
         # Amazon HTML-encodes the JSON in some places, so check both forms
-        return vendor_code in page_source or vendor_code.replace(":", "&colon;") in page_source
+        shown = vendor_code in page_source or vendor_code.replace(":", "&colon;") in page_source
+        return shown, product_name
     except Exception:
-        return False
+        return False, ""
 
 
 def scrape_videos_stream(url: str, headless: bool = True):
@@ -178,7 +189,7 @@ def scrape_videos_stream(url: str, headless: bool = True):
                 "title": entry.title,
                 "asin": entry.asin,
             }
-            entry.shown_on_product_page = check_shown_on_product_page(driver, entry)
+            entry.shown_on_product_page, entry.product_name = check_shown_on_product_page(driver, entry)
             yield "video", {**asdict(entry), "index": i, "total": len(entries)}
 
         shown = sum(1 for e in entries if e.shown_on_product_page)
@@ -226,7 +237,7 @@ def scrape_videos(url: str, headless: bool = True) -> list[VideoEntry]:
         # these checks, which meant cookies were never actually reused.
         print(f"\nChecking {len(entries)} product pages for video visibility...")
         for i, entry in enumerate(entries, 1):
-            entry.shown_on_product_page = check_shown_on_product_page(driver, entry)
+            entry.shown_on_product_page, entry.product_name = check_shown_on_product_page(driver, entry)
             status = "✓" if entry.shown_on_product_page else "✗"
             print(f"  [{status}] {i}/{len(entries)}: {entry.title[:60]}")
 

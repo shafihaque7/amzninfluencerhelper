@@ -60,11 +60,13 @@ function VideoCard({ video, isChecking }) {
       </p>
 
       <div className="flex flex-col gap-1 text-xs text-gray-500">
+        {video.product_name && (
+          <span className="bg-gray-50 px-2 py-0.5 rounded w-fit">
+            Product: {video.product_name.split(" ").slice(0, 5).join(" ") + (video.product_name.split(" ").length > 5 ? "…" : "")}
+          </span>
+        )}
         {video.asin && (
           <span className="font-mono bg-gray-50 px-2 py-0.5 rounded w-fit">ASIN: {video.asin}</span>
-        )}
-        {video.vendor_code && (
-          <span className="font-mono bg-gray-50 px-2 py-0.5 rounded w-fit">Vendor: {video.vendor_code}</span>
         )}
       </div>
 
@@ -89,7 +91,7 @@ function VideoCard({ video, isChecking }) {
 
 function LogLine({ icon, text, dim }) {
   return (
-    <div className={`flex items-start gap-2 text-xs ${dim ? "opacity-50" : ""}`}>
+    <div className={`flex items-start gap-2 text-xs text-slate-200 ${dim ? "opacity-40" : ""}`}>
       <span className="mt-0.5 shrink-0">{icon}</span>
       <span>{text}</span>
     </div>
@@ -155,7 +157,7 @@ export default function App() {
           setVideos((prev) => {
             const alreadyThere = prev.some((v) => v.index === msg.index);
             if (alreadyThere) return prev;
-            return [...prev, { index: msg.index, title: msg.title, asin: msg.asin, product_url: `https://www.amazon.com/dp/${msg.asin}`, vendor_code: "", shown_on_product_page: false, _checking: true }];
+            return [...prev, { index: msg.index, title: msg.title, asin: msg.asin, product_url: `https://www.amazon.com/dp/${msg.asin}`, vendor_code: "", product_name: "", shown_on_product_page: false, _checking: true }];
           });
           break;
 
