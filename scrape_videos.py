@@ -2,8 +2,9 @@
 Scrapes video titles, product links, and product-page visibility from an
 Amazon influencer storefront page.
 
-Uses Selenium to render JS content, then reuses the browser session cookies
-with requests for fast parallel product-page checks.
+Uses Selenium throughout: first to load the storefront, then to load each
+product page so JavaScript-rendered video widgets are fully present before
+checking for the influencer's vendor_code.
 
 Usage:
     python3 scrape_videos.py
@@ -18,7 +19,6 @@ import re
 import time
 from dataclasses import dataclass, field
 
-import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -91,27 +91,103 @@ def extract_entries_from_html(html: str) -> list[VideoEntry]:
     return entries
 
 
-def build_requests_session(driver: webdriver.Chrome) -> requests.Session:
-    """Copy Selenium cookies into a requests session so it passes Amazon's bot checks."""
-    session = requests.Session()
-    for cookie in driver.get_cookies():
-        session.cookies.set(cookie["name"], cookie["value"])
-    return session
-
-
 def check_shown_on_product_page(
-    session: requests.Session, entry: VideoEntry, delay: float = 0.4
+    driver: webdriver.Chrome, entry: VideoEntry, scroll_pause: float = 0.6
 ) -> bool:
-    """Return True if the influencer's vendor_code appears on the product page."""
+    """
+    Load the product page with Selenium (so JS-rendered video widgets are present)
+    and return True if the influencer's vendor_code appears anywhere in the DOM.
+
+    Plain requests won't work here for two reasons:
+      1. Amazon detects bots and returns a ~5 KB stub instead of the real page.
+      2. The "Videos for this product" widget is injected by JavaScript after
+         the initial HTML is delivered, so it would be invisible to requests even
+         on a full page load.
+    """
     if not entry.asin or not entry.vendor_code:
         return False
+
     try:
-        resp = session.get(entry.product_url, headers=HEADERS, timeout=15)
-        time.sleep(delay)
-        # Amazon HTML-encodes the JSON, so check both plain and encoded forms
-        return entry.vendor_code in resp.text or entry.vendor_code.replace(":", "&colon;") in resp.text
-    except requests.RequestException:
+        driver.get(entry.product_url)
+
+        # Wait until the body is present, then scroll to trigger lazy video widgets
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        for _ in range(8):
+            driver.execute_script("window.scrollBy(0, 600)")
+            time.sleep(scroll_pause)
+
+        page_source = driver.page_source
+        vendor_code = entry.vendor_code
+        # Amazon HTML-encodes the JSON in some places, so check both forms
+        return vendor_code in page_source or vendor_code.replace(":", "&colon;") in page_source
+    except Exception:
         return False
+
+
+def scrape_videos_stream(url: str, headless: bool = True):
+    """
+    Generator that yields (event_type, payload) tuples as scraping progresses.
+    Designed for consumption by the SSE endpoint in api.py.
+    """
+    from dataclasses import asdict
+
+    driver = build_driver(headless)
+    try:
+        yield "status", {"message": f"Opening storefront page…"}
+        driver.get(url)
+
+        wait = WebDriverWait(driver, 20)
+        try:
+            wait.until(EC.presence_of_element_located((By.ID, "videoTab")))
+        except Exception:
+            yield "error", {"message": "Could not find the Videos tab. The storefront may not have videos or took too long to load."}
+            return
+        time.sleep(2)
+
+        yield "status", {"message": "Clicking Videos tab…"}
+        video_tab = driver.find_element(By.ID, "videoTab")
+        driver.execute_script("arguments[0].click();", video_tab)
+
+        try:
+            wait.until(EC.invisibility_of_element_located((By.ID, "videoTabSpinner")))
+        except Exception:
+            pass
+        time.sleep(3)
+
+        yield "status", {"message": "Scrolling to load all video cards…"}
+        for _ in range(12):
+            driver.execute_script("window.scrollBy(0, 800)")
+            time.sleep(0.8)
+
+        container = driver.find_element(By.ID, "videoTabContentContainer")
+        inner_html = container.get_attribute("innerHTML")
+        entries = extract_entries_from_html(inner_html)
+
+        if not entries:
+            yield "done", {"total": 0, "shown": 0, "not_shown": 0}
+            return
+
+        yield "found", {"total": len(entries), "message": f"Found {len(entries)} videos — checking each product page…"}
+
+        for i, entry in enumerate(entries, 1):
+            yield "checking", {
+                "index": i,
+                "total": len(entries),
+                "title": entry.title,
+                "asin": entry.asin,
+            }
+            entry.shown_on_product_page = check_shown_on_product_page(driver, entry)
+            yield "video", {**asdict(entry), "index": i, "total": len(entries)}
+
+        shown = sum(1 for e in entries if e.shown_on_product_page)
+        yield "done", {"total": len(entries), "shown": shown, "not_shown": len(entries) - shown}
+
+    except Exception as exc:
+        yield "error", {"message": str(exc)}
+    finally:
+        driver.quit()
 
 
 def scrape_videos(url: str, headless: bool = True) -> list[VideoEntry]:
@@ -145,17 +221,17 @@ def scrape_videos(url: str, headless: bool = True) -> list[VideoEntry]:
         inner_html = container.get_attribute("innerHTML")
         entries = extract_entries_from_html(inner_html)
 
-        # Reuse the browser's authenticated session for product page checks
-        session = build_requests_session(driver)
+        # Product page checks happen inside the try block so the driver (and its
+        # authenticated session) stays alive. The driver quit used to happen before
+        # these checks, which meant cookies were never actually reused.
+        print(f"\nChecking {len(entries)} product pages for video visibility...")
+        for i, entry in enumerate(entries, 1):
+            entry.shown_on_product_page = check_shown_on_product_page(driver, entry)
+            status = "✓" if entry.shown_on_product_page else "✗"
+            print(f"  [{status}] {i}/{len(entries)}: {entry.title[:60]}")
 
     finally:
         driver.quit()
-
-    print(f"\nChecking {len(entries)} product pages for video visibility...")
-    for i, entry in enumerate(entries, 1):
-        entry.shown_on_product_page = check_shown_on_product_page(session, entry)
-        status = "✓" if entry.shown_on_product_page else "✗"
-        print(f"  [{status}] {i}/{len(entries)}: {entry.title[:60]}")
 
     return entries
 
