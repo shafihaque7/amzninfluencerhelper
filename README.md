@@ -2,7 +2,8 @@
 
 Scrapes an Amazon influencer storefront to report which of their videos are actually surfacing on product pages — and uses OpenAI to suggest better titles for the ones that aren't.
 
-![Uploading image.png…]()
+<img width="1987" height="1126" alt="image" src="https://github.com/user-attachments/assets/fc439fa6-6d0d-4ace-82ef-4d8fe14ec7dd" />
+
 
 ---
 
