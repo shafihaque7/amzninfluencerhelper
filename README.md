@@ -4,6 +4,7 @@ Scrapes an Amazon influencer storefront to report which of their videos are actu
 
 <img width="1987" height="1126" alt="image" src="https://github.com/user-attachments/assets/fc439fa6-6d0d-4ace-82ef-4d8fe14ec7dd" />
 
+**Live demo:** https://amzn-influencer.wittyriver-1861e423.eastus.azurecontainerapps.io
 
 ---
 
