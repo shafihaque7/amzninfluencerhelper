@@ -184,11 +184,14 @@ export default function App() {
 
         case "video":
           setChecking(null);
-          setVideos((prev) =>
-            prev.map((v) =>
-              v.index === msg.index ? { ...msg, _checking: false } : v
-            )
-          );
+          setVideos((prev) => {
+            const exists = prev.some((v) => v.index === msg.index);
+            if (exists) {
+              return prev.map((v) => v.index === msg.index ? { ...msg, _checking: false } : v);
+            }
+            // Cache replay: no prior "checking" event, so add the card directly
+            return [...prev, { ...msg, _checking: false }];
+          });
           addLog(
             msg.shown_on_product_page ? "✅" : "❌",
             `${msg.index}/${msg.total} — ${msg.title.slice(0, 60)}`

@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 # Load .env so GEMINI_API_KEY is available without a shell export
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=True)
 except ImportError:
     pass  # dotenv is optional; fall back to process env
 

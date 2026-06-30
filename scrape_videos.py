@@ -19,7 +19,9 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
+from queue import Queue
 from typing import Generator
 
 from selenium import webdriver
@@ -41,6 +43,9 @@ _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+# Parallel product-page checkers (each gets its own Chrome instance)
+_MAX_WORKERS = 4
 
 # Timing / scroll tuning — adjust without touching logic
 _PAGE_LOAD_TIMEOUT = 20
@@ -192,14 +197,21 @@ def scrape_videos_stream(url: str, headless: bool = True) -> Generator[SseEvent,
     """
     Yield (event_type, payload) tuples as scraping progresses.
     Designed for consumption by the SSE endpoint in api.py.
-    """
-    driver = build_driver(headless)
-    try:
-        log.info("Scraping storefront: %s", url)
-        yield "status", {"message": "Opening storefront page…"}
 
+    Product-page checks run in parallel across _MAX_WORKERS Chrome instances.
+    All "checking" events are emitted upfront so the UI can render all cards
+    immediately; "video" events then arrive in completion order.
+    """
+    log.info("Scraping storefront: %s", url)
+    yield "status", {"message": "Opening storefront page…"}
+
+    storefront_driver = build_driver(headless)
+    worker_drivers: list[webdriver.Chrome] = []
+    entries: list[VideoEntry] = []
+
+    try:
         try:
-            inner_html = _load_storefront(driver, url)
+            inner_html = _load_storefront(storefront_driver, url)
         except RuntimeError as exc:
             yield "error", {"message": str(exc)}
             return
@@ -217,6 +229,7 @@ def scrape_videos_stream(url: str, headless: bool = True) -> Generator[SseEvent,
             "message": f"Found {len(entries)} videos — checking each product page…",
         }
 
+        # Emit all checking events upfront so the UI renders all cards in pending state
         for i, entry in enumerate(entries, 1):
             yield "checking", {
                 "index": i,
@@ -224,54 +237,114 @@ def scrape_videos_stream(url: str, headless: bool = True) -> Generator[SseEvent,
                 "title": entry.title,
                 "asin": entry.asin,
             }
-            entry.shown_on_product_page, entry.product_name = check_shown_on_product_page(driver, entry)
-            log.debug("[%d/%d] shown=%s  %s", i, len(entries), entry.shown_on_product_page, entry.title[:60])
-            yield "video", {**asdict(entry), "index": i, "total": len(entries)}
 
-        shown = sum(1 for e in entries if e.shown_on_product_page)
-        yield "done", {"total": len(entries), "shown": shown, "not_shown": len(entries) - shown}
+        # Build a pool of Chrome drivers — reuse the storefront driver as worker #0
+        num_workers = min(_MAX_WORKERS, len(entries))
+        worker_drivers = [storefront_driver]
+        driver_pool: Queue[webdriver.Chrome] = Queue()
+        driver_pool.put(storefront_driver)
+        for _ in range(num_workers - 1):
+            d = build_driver(headless)
+            worker_drivers.append(d)
+            driver_pool.put(d)
 
-        # Suggest better titles for the first 10 not-shown videos via Gemini
-        openai_key = os.getenv("OPENAI_API_KEY", "")
-        not_shown_entries = [(i + 1, e) for i, e in enumerate(entries) if not e.shown_on_product_page][:10]
-        if openai_key and not_shown_entries:
-            from suggest import INTER_REQUEST_DELAY, suggest_better_title
-            yield "status", {"message": f"Generating title suggestions for {len(not_shown_entries)} not-shown videos…"}
-            for i, (orig_idx, entry) in enumerate(not_shown_entries):
-                if i > 0:
-                    time.sleep(INTER_REQUEST_DELAY)
-                suggestion = suggest_better_title(entry, openai_key)
-                if suggestion["suggested_title"]:
-                    yield "suggestion", {
-                        "asin": entry.asin,
-                        "index": orig_idx,
-                        "reason": suggestion["reason"],
-                        "suggested_title": suggestion["suggested_title"],
-                    }
-        yield "stream_end", {}
+        def _check_entry(entry: VideoEntry, index: int) -> tuple[int, VideoEntry]:
+            driver = driver_pool.get()
+            try:
+                entry.shown_on_product_page, entry.product_name = check_shown_on_product_page(driver, entry)
+            finally:
+                driver_pool.put(driver)
+            return index, entry
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(_check_entry, entry, i + 1): i + 1
+                for i, entry in enumerate(entries)
+            }
+            for future in as_completed(futures):
+                try:
+                    index, entry = future.result()
+                except Exception as exc:
+                    log.warning("Worker error: %s", exc)
+                    continue
+                log.debug("[%d/%d] shown=%s  %s", index, len(entries), entry.shown_on_product_page, entry.title[:60])
+                yield "video", {**asdict(entry), "index": index, "total": len(entries)}
 
     except Exception as exc:
         log.exception("Unexpected error during scrape")
         yield "error", {"message": str(exc)}
+        return
     finally:
-        driver.quit()
+        for d in (worker_drivers or [storefront_driver]):
+            try:
+                d.quit()
+            except Exception:
+                pass
+
+    shown = sum(1 for e in entries if e.shown_on_product_page)
+    yield "done", {"total": len(entries), "shown": shown, "not_shown": len(entries) - shown}
+
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    not_shown_entries = [(i + 1, e) for i, e in enumerate(entries) if not e.shown_on_product_page][:10]
+    if openai_key and not_shown_entries:
+        from suggest import INTER_REQUEST_DELAY, suggest_better_title
+        yield "status", {"message": f"Generating title suggestions for {len(not_shown_entries)} not-shown videos…"}
+        for i, (orig_idx, entry) in enumerate(not_shown_entries):
+            if i > 0:
+                time.sleep(INTER_REQUEST_DELAY)
+            suggestion = suggest_better_title(entry, openai_key)
+            if suggestion["suggested_title"]:
+                yield "suggestion", {
+                    "asin": entry.asin,
+                    "index": orig_idx,
+                    "reason": suggestion["reason"],
+                    "suggested_title": suggestion["suggested_title"],
+                }
+    yield "stream_end", {}
 
 
 def scrape_videos(url: str, headless: bool = True) -> list[VideoEntry]:
     """Blocking version of the scraper. Returns the completed VideoEntry list."""
-    driver = build_driver(headless)
+    storefront_driver = build_driver(headless)
+    worker_drivers: list[webdriver.Chrome] = []
+    entries: list[VideoEntry] = []
+
     try:
         log.info("Loading storefront: %s", url)
-        inner_html = _load_storefront(driver, url)
+        inner_html = _load_storefront(storefront_driver, url)
         entries = extract_entries_from_html(inner_html)
 
-        log.info("Checking %d product pages for video visibility…", len(entries))
-        for i, entry in enumerate(entries, 1):
-            entry.shown_on_product_page, entry.product_name = check_shown_on_product_page(driver, entry)
-            status = "✓" if entry.shown_on_product_page else "✗"
-            log.info("[%s] %d/%d: %s", status, i, len(entries), entry.title[:60])
+        if entries:
+            num_workers = min(_MAX_WORKERS, len(entries))
+            worker_drivers = [storefront_driver]
+            driver_pool: Queue[webdriver.Chrome] = Queue()
+            driver_pool.put(storefront_driver)
+            for _ in range(num_workers - 1):
+                d = build_driver(headless)
+                worker_drivers.append(d)
+                driver_pool.put(d)
+
+            def _check(entry: VideoEntry, index: int) -> None:
+                d = driver_pool.get()
+                try:
+                    entry.shown_on_product_page, entry.product_name = check_shown_on_product_page(d, entry)
+                    status = "✓" if entry.shown_on_product_page else "✗"
+                    log.info("[%s] %d/%d: %s", status, index, len(entries), entry.title[:60])
+                finally:
+                    driver_pool.put(d)
+
+            log.info("Checking %d product pages across %d workers…", len(entries), num_workers)
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(_check, e, i + 1) for i, e in enumerate(entries)]
+                for f in as_completed(futures):
+                    f.result()  # surface any worker exceptions
+
     finally:
-        driver.quit()
+        for d in (worker_drivers or [storefront_driver]):
+            try:
+                d.quit()
+            except Exception:
+                pass
 
     return entries
 
