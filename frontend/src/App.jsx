@@ -497,6 +497,19 @@ export default function App() {
             </div>
           )}
 
+          {/* AI suggestion info banner — shown when there are more not-shown videos than the auto-suggested 10 */}
+          {phase === "done" && summary && summary.not_shown > 10 && (
+            <div className="flex items-start gap-3 rounded-2xl bg-amber-500/10 border border-amber-400/20 px-4 py-3 text-xs text-amber-200">
+              <svg className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span>
+                AI title suggestions are auto-generated for the <strong className="text-amber-300">first 10 not-shown videos</strong>.
+                For the remaining {summary.not_shown - 10}, click <strong className="text-amber-300">Get AI title suggestion</strong> on each card.
+              </span>
+            </div>
+          )}
+
           {/* Video cards grid */}
           {filteredVideos.length > 0 && (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
