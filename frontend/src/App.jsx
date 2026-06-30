@@ -40,7 +40,7 @@ function Badge({ shown }) {
   );
 }
 
-function VideoCard({ video, isChecking }) {
+function VideoCard({ video, isChecking, suggestion }) {
   return (
     <div className={`bg-white rounded-2xl shadow-sm border p-5 flex flex-col gap-3 transition-all duration-300 ${isChecking ? "border-indigo-300 ring-2 ring-indigo-200" : "border-gray-100 hover:shadow-md"}`}>
       <div className="flex items-start justify-between gap-3">
@@ -83,6 +83,25 @@ function VideoCard({ video, isChecking }) {
           </svg>
         </a>
       )}
+
+      {/* AI title suggestion — only for not-shown videos */}
+      {!isChecking && !video.shown_on_product_page && suggestion && (
+        <div className="mt-1 pt-3 border-t border-amber-100 flex flex-col gap-1.5">
+          <span className="text-xs font-semibold text-amber-600">AI Suggested Title</span>
+          <p className="text-xs font-medium text-gray-800">"{suggestion.suggested_title}"</p>
+          {suggestion.reason && (
+            <p className="text-xs text-gray-400 italic leading-relaxed">{suggestion.reason}</p>
+          )}
+        </div>
+      )}
+
+      {/* Spinner while suggestion is loading */}
+      {!isChecking && !video.shown_on_product_page && suggestion === "loading" && (
+        <div className="mt-1 pt-3 border-t border-amber-100 flex items-center gap-2 text-xs text-amber-500">
+          <Spinner className="h-3 w-3" />
+          Generating title suggestion…
+        </div>
+      )}
     </div>
   );
 }
@@ -110,6 +129,7 @@ export default function App() {
   const [summary, setSummary] = useState(null); // {shown, not_shown}
   const [errorMsg, setErrorMsg] = useState("");
   const [filter, setFilter] = useState("all");
+  const [suggestions, setSuggestions] = useState({}); // keyed by asin
   const esRef = useRef(null);
 
   function addLog(icon, text) {
@@ -134,6 +154,7 @@ export default function App() {
     setSummary(null);
     setErrorMsg("");
     setFilter("all");
+    setSuggestions({});
 
     const es = new EventSource(`/scrape/stream?url=${encodeURIComponent(url)}`);
     esRef.current = es;
@@ -178,14 +199,39 @@ export default function App() {
           setSummary({ shown: msg.shown, not_shown: msg.not_shown });
           setPhase("done");
           addLog("🏁", `Done! ${msg.shown} of ${msg.total} shown on product pages.`);
-          es.close();
-          esRef.current = null;
+          // Mark not-shown videos as awaiting a suggestion (backend may send them next)
+          setVideos((prev) => {
+            const pending = {};
+            prev.filter((v) => !v._checking && !v.shown_on_product_page).slice(0, 10)
+              .forEach((v) => { pending[v.asin] = "loading"; });
+            if (Object.keys(pending).length > 0) setSuggestions(pending);
+            return prev;
+          });
+          break;
+
+        case "suggestion":
+          setSuggestions((prev) => ({
+            ...prev,
+            [msg.asin]: { reason: msg.reason, suggested_title: msg.suggested_title },
+          }));
+          addLog("💡", `Title suggestion ready for #${msg.index}`);
           break;
 
         case "error":
           setErrorMsg(msg.message);
           setPhase("error");
           addLog("🚨", msg.message);
+          // Clear any pending "loading" suggestion badges on error
+          setSuggestions((prev) => {
+            const cleaned = { ...prev };
+            Object.keys(cleaned).forEach((k) => { if (cleaned[k] === "loading") delete cleaned[k]; });
+            return cleaned;
+          });
+          es.close();
+          esRef.current = null;
+          break;
+
+        case "stream_end":
           es.close();
           esRef.current = null;
           break;
@@ -376,6 +422,7 @@ export default function App() {
                   key={video.index}
                   video={video}
                   isChecking={!!video._checking}
+                  suggestion={suggestions[video.asin]}
                 />
               ))}
             </div>
